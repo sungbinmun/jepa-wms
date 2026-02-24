@@ -1,0 +1,3 @@
+[submodule "slotcontrast"]
+	path = slotcontrast
+	url = git@github.com:sungbinmun/slotcontrast.git
