@@ -26,3 +26,10 @@ MUJOCO_LOG.TXT
 
 macros.py
 CLAUDE.md
+
+/data
+/datasets
+/outputs
+/logs
+/saved_checkpoints
+/.hf_chache

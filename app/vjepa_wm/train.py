@@ -641,15 +641,21 @@ def main(args, resume_preempt=False):
 
     # DDP wrapping after loading state_dicts
     if not freeze_encoder:
-        encoder = DDP(encoder, static_graph=False, find_unused_parameters=False)
+        encoder = DDP(encoder, static_graph=False, find_unused_parameters=False, broadcast_buffers=False)
     if train_predictor:
         if action_encoder is not None:
-            action_encoder = DDP(action_encoder, static_graph=False, find_unused_parameters=False)
+            action_encoder = DDP(
+                action_encoder, static_graph=False, find_unused_parameters=False, broadcast_buffers=False
+            )
         if proprio_encoder is not None:
-            proprio_encoder = DDP(proprio_encoder, static_graph=False, find_unused_parameters=False)
-        predictor = DDP(predictor, static_graph=False, find_unused_parameters=False)
+            proprio_encoder = DDP(
+                proprio_encoder, static_graph=False, find_unused_parameters=False, broadcast_buffers=False
+            )
+        predictor = DDP(predictor, static_graph=False, find_unused_parameters=False, broadcast_buffers=False)
     for name in heads.keys():
-        heads[name].model = DDP(heads[name].model, static_graph=False, find_unused_parameters=False)
+        heads[name].model = DDP(
+            heads[name].model, static_graph=False, find_unused_parameters=False, broadcast_buffers=False
+        )
 
     # Prepare VideoWM kwargs from config
     wm_kwargs = {
