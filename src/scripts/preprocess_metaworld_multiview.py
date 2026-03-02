@@ -20,6 +20,10 @@ The output is written as parquet shards with additional columns:
 - `mask_gripper` (compressed npz bytes, int32 [T, H, W])
 - `mask_cat_third` (compressed npz bytes, uint8 [T, H, W], 0:bg 1:fg 2:agent)
 - `mask_cat_gripper` (compressed npz bytes, uint8 [T, H, W], 0:bg 1:fg 2:agent)
+- `mask_robot_third` (compressed npz bytes, uint8 [T, H, W], 1:robot)
+- `mask_robot_gripper` (compressed npz bytes, uint8 [T, H, W], 1:robot)
+- `mask_nonrobot_third` (compressed npz bytes, uint8 [T, H, W], 1:non-robot)
+- `mask_nonrobot_gripper` (compressed npz bytes, uint8 [T, H, W], 1:non-robot)
 
 For compatibility with existing single-view loaders, `video` is also emitted and
 set equal to `video_third`.
@@ -72,6 +76,10 @@ OUTPUT_FEATURES = Features(
         "mask_gripper": Value("binary"),
         "mask_cat_third": Value("binary"),
         "mask_cat_gripper": Value("binary"),
+        "mask_robot_third": Value("binary"),
+        "mask_robot_gripper": Value("binary"),
+        "mask_nonrobot_third": Value("binary"),
+        "mask_nonrobot_gripper": Value("binary"),
         "states": Sequence(Sequence(Value("float32"))),
         "actions": Sequence(Sequence(Value("float32"))),
         "rewards": Sequence(Value("float32")),
@@ -131,6 +139,7 @@ _MJOBJ_TYPE_IDS = {
 }
 _MJ_SEG_OBJTYPE_GEOM = int(mujoco.mjtObj.mjOBJ_GEOM)  # 5 in MuJoCo 3.x
 _MJ_SEG_OBJTYPE_SITE = int(mujoco.mjtObj.mjOBJ_SITE)  # 6 in MuJoCo 3.x
+_MJ_SEG_OBJTYPE_BODY = int(mujoco.mjtObj.mjOBJ_BODY)  # 1 in MuJoCo 3.x
 
 
 def _default_input_dir() -> Optional[Path]:
@@ -314,6 +323,42 @@ def _build_category_id_sets(model) -> Tuple[set[int], set[int]]:
     """Return (bg_ids, agent_ids) for packed instance labels for one task model."""
     bg_ids: set[int] = set()
     agent_ids: set[int] = set()
+    bg_body, agent_body = _build_body_category_flags(model)
+    nbody = int(model.nbody)
+
+    for bid in range(nbody):
+        bname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+        packed = _pack_label(_MJ_SEG_OBJTYPE_BODY, bid)
+        if bool(bg_body[bid]) or _is_bg_name(bname):
+            bg_ids.add(packed)
+        if bool(agent_body[bid]) or _is_agent_name(bname):
+            agent_ids.add(packed)
+
+    for gid in range(model.ngeom):
+        gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        bid = int(model.geom_bodyid[gid])
+        packed = _pack_label(_MJ_SEG_OBJTYPE_GEOM, gid)
+        if (0 <= bid < nbody and bool(bg_body[bid])) or _is_bg_name(gname):
+            bg_ids.add(packed)
+        if (0 <= bid < nbody and bool(agent_body[bid])) or _is_agent_name(gname):
+            agent_ids.add(packed)
+
+    for sid in range(model.nsite):
+        sname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, sid)
+        bid = int(model.site_bodyid[sid])
+        packed = _pack_label(_MJ_SEG_OBJTYPE_SITE, sid)
+        if (0 <= bid < nbody and bool(bg_body[bid])) or _is_bg_name(sname):
+            bg_ids.add(packed)
+        if (0 <= bid < nbody and bool(agent_body[bid])) or _is_agent_name(sname):
+            agent_ids.add(packed)
+
+    # If an element matches both classes, prefer agent assignment (robot safety).
+    bg_ids.difference_update(agent_ids)
+    return bg_ids, agent_ids
+
+
+def _build_body_category_flags(model) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (bg_body, agent_body) boolean arrays indexed by body id."""
     nbody = int(model.nbody)
     body_parentid = np.asarray(model.body_parentid, dtype=np.int32)
     body_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid) for bid in range(nbody)]
@@ -336,27 +381,93 @@ def _build_category_id_sets(model) -> Tuple[set[int], set[int]]:
                 agent_body[bid] = True
             if bg_body[pid]:
                 bg_body[bid] = True
+    return bg_body, agent_body
 
-    for gid in range(model.ngeom):
-        gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
-        bid = int(model.geom_bodyid[gid])
-        packed = _pack_label(_MJ_SEG_OBJTYPE_GEOM, gid)
-        if (0 <= bid < nbody and bg_body[bid]) or _is_bg_name(gname):
-            bg_ids.add(packed)
-        if (0 <= bid < nbody and agent_body[bid]) or _is_agent_name(gname):
-            agent_ids.add(packed)
 
-    for sid in range(model.nsite):
-        sname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, sid)
-        bid = int(model.site_bodyid[sid])
-        packed = _pack_label(_MJ_SEG_OBJTYPE_SITE, sid)
-        if (0 <= bid < nbody and bg_body[bid]) or _is_bg_name(sname):
-            bg_ids.add(packed)
-        if (0 <= bid < nbody and agent_body[bid]) or _is_agent_name(sname):
-            agent_ids.add(packed)
+def _resolve_name_and_body_for_packed_id(model, packed_id: int) -> Tuple[Optional[str], int]:
+    obj_type = (int(packed_id) // 100000) - 1
+    obj_id = (int(packed_id) % 100000) - 1
+    name = None
+    bid = -1
 
-    # If an element matches both classes, prefer agent assignment (robot safety).
-    bg_ids.difference_update(agent_ids)
+    if obj_type == _MJ_SEG_OBJTYPE_GEOM:
+        if 0 <= obj_id < int(model.ngeom):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, obj_id)
+            bid = int(model.geom_bodyid[obj_id])
+        return name, bid
+
+    if obj_type == _MJ_SEG_OBJTYPE_SITE:
+        if 0 <= obj_id < int(model.nsite):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, obj_id)
+            bid = int(model.site_bodyid[obj_id])
+        return name, bid
+
+    if obj_type == _MJ_SEG_OBJTYPE_BODY:
+        if 0 <= obj_id < int(model.nbody):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, obj_id)
+            bid = obj_id
+        return name, bid
+
+    if obj_type in _MJOBJ_TYPE_IDS and obj_id >= 0:
+        try:
+            name = mujoco.mj_id2name(model, mujoco.mjtObj(obj_type), obj_id)
+        except Exception:
+            name = None
+    return name, bid
+
+
+def _classify_packed_id(
+    model,
+    packed_id: int,
+    bg_body: np.ndarray,
+    agent_body: np.ndarray,
+) -> Tuple[bool, bool]:
+    """Classify packed id as (is_bg, is_agent)."""
+    if int(packed_id) <= 0:
+        return True, False
+
+    name, bid = _resolve_name_and_body_for_packed_id(model, packed_id)
+    is_bg = False
+    is_agent = False
+
+    if 0 <= bid < len(agent_body):
+        is_bg = bool(bg_body[bid])
+        is_agent = bool(agent_body[bid])
+
+    if _is_bg_name(name):
+        is_bg = True
+    if _is_agent_name(name):
+        is_agent = True
+
+    if is_agent:
+        is_bg = False
+    return is_bg, is_agent
+
+
+def _resolve_category_sets_for_masks(
+    masks: Iterable[np.ndarray],
+    model,
+    bg_body: np.ndarray,
+    agent_body: np.ndarray,
+    packed_id_cache: Dict[int, Tuple[bool, bool]],
+) -> Tuple[set[int], set[int]]:
+    """Build (bg_ids, agent_ids) from packed ids observed in provided masks."""
+    unique_ids: set[int] = set()
+    for m in masks:
+        unique_ids.update(int(x) for x in np.unique(m).tolist())
+
+    bg_ids: set[int] = set()
+    agent_ids: set[int] = set()
+    for packed_id in unique_ids:
+        out = packed_id_cache.get(packed_id)
+        if out is None:
+            out = _classify_packed_id(model, packed_id, bg_body=bg_body, agent_body=agent_body)
+            packed_id_cache[packed_id] = out
+        is_bg, is_agent = out
+        if is_agent:
+            agent_ids.add(int(packed_id))
+        elif is_bg:
+            bg_ids.add(int(packed_id))
     return bg_ids, agent_ids
 
 
@@ -371,6 +482,20 @@ def _instance_to_category_mask(
     out[bg] = 0
     out[agent & (~bg)] = 2
     return out
+
+
+def _instance_to_robot_nonrobot_masks(
+    instance_mask: np.ndarray,
+    agent_ids: set[int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (robot_mask, nonrobot_mask), each uint8 with values in {0,1}."""
+    m = instance_mask.astype(np.int32, copy=False)
+    if not agent_ids:
+        robot = np.zeros(m.shape, dtype=np.uint8)
+    else:
+        robot = np.isin(m, list(agent_ids)).astype(np.uint8)
+    nonrobot = (1 - robot).astype(np.uint8, copy=False)
+    return robot, nonrobot
 
 
 def _normalize_packed_instance_mask(instance_mask: np.ndarray) -> np.ndarray:
@@ -408,16 +533,42 @@ def _normalize_packed_instance_mask(instance_mask: np.ndarray) -> np.ndarray:
     return repaired.astype(np.int32, copy=False)
 
 
-def _iter_selected_indices(ds, start: int, end: Optional[int], max_episodes: Optional[int]) -> List[int]:
+def _iter_selected_indices(ds, start: int, end: Optional[int]) -> List[int]:
     n = len(ds)
     start = max(0, int(start))
     stop = n if end is None else min(n, int(end))
     if stop <= start:
         return []
-    indices = list(range(start, stop))
-    if max_episodes is not None:
-        indices = indices[: int(max_episodes)]
-    return indices
+    return list(range(start, stop))
+
+
+def _filter_indices_by_task(
+    ds,
+    indices: List[int],
+    selected_tasks: Optional[List[str]],
+    max_episodes_per_task: Optional[int],
+    max_episodes_total: Optional[int],
+) -> List[int]:
+    if selected_tasks is None and max_episodes_per_task is None and max_episodes_total is None:
+        return indices
+
+    allowed = None if selected_tasks is None else set(str(t) for t in selected_tasks)
+    per_task_limit = None if max_episodes_per_task is None else int(max_episodes_per_task)
+    total_limit = None if max_episodes_total is None else int(max_episodes_total)
+    kept: List[int] = []
+    task_counts: Dict[str, int] = {}
+
+    for idx in indices:
+        task = str(ds[int(idx)]["task"])
+        if allowed is not None and task not in allowed:
+            continue
+        if per_task_limit is not None and task_counts.get(task, 0) >= per_task_limit:
+            continue
+        kept.append(int(idx))
+        task_counts[task] = task_counts.get(task, 0) + 1
+        if total_limit is not None and len(kept) >= total_limit:
+            break
+    return kept
 
 
 def _to_serializable_rows(rows: Iterable[Dict]) -> List[Dict]:
@@ -435,6 +586,10 @@ def _to_serializable_rows(rows: Iterable[Dict]) -> List[Dict]:
                 "mask_gripper": row["mask_gripper"],
                 "mask_cat_third": row["mask_cat_third"],
                 "mask_cat_gripper": row["mask_cat_gripper"],
+                "mask_robot_third": row["mask_robot_third"],
+                "mask_robot_gripper": row["mask_robot_gripper"],
+                "mask_nonrobot_third": row["mask_nonrobot_third"],
+                "mask_nonrobot_gripper": row["mask_nonrobot_gripper"],
                 "states": row["states"],
                 "actions": row["actions"],
                 "rewards": row["rewards"],
@@ -446,7 +601,16 @@ def _to_serializable_rows(rows: Iterable[Dict]) -> List[Dict]:
 
 
 def _write_shard(rows: List[Dict], out_path: Path):
-    ds = Dataset.from_list(_to_serializable_rows(rows), features=OUTPUT_FEATURES)
+    rows_serializable = _to_serializable_rows(rows)
+    try:
+        ds = Dataset.from_list(rows_serializable, features=OUTPUT_FEATURES)
+    except RuntimeError as exc:
+        # Some environments cannot import torchcodec/ffmpeg at write time.
+        # Fall back to schema inference; video columns remain {"bytes","path"} structs.
+        if "torchcodec" not in str(exc).lower():
+            raise
+        print(f"[warn] torchcodec unavailable while writing {out_path.name}; using inferred schema.")
+        ds = Dataset.from_list(rows_serializable)
     ds.to_parquet(str(out_path))
 
 
@@ -476,6 +640,18 @@ def main():
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=None)
     parser.add_argument("--max-episodes", type=int, default=None)
+    parser.add_argument(
+        "--max-episodes-per-task",
+        type=int,
+        default=None,
+        help="Optional cap per task after --task filtering.",
+    )
+    parser.add_argument(
+        "--task",
+        action="append",
+        default=None,
+        help="Task name to keep (e.g., mw-assembly). Pass multiple times for multiple tasks.",
+    )
     parser.add_argument("--shard-size", type=int, default=64)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-failed", action="store_true")
@@ -509,15 +685,27 @@ def main():
     src = src.cast_column("video", Video(decode=False))
     print(f"Total source episodes: {len(src)}")
 
-    indices = _iter_selected_indices(src, args.start_index, args.end_index, args.max_episodes)
+    indices = _iter_selected_indices(src, args.start_index, args.end_index)
+    indices = _filter_indices_by_task(
+        src,
+        indices,
+        selected_tasks=args.task,
+        max_episodes_per_task=args.max_episodes_per_task,
+        max_episodes_total=args.max_episodes,
+    )
     if not indices:
-        raise ValueError("No episodes selected. Check --start-index/--end-index/--max-episodes.")
+        raise ValueError(
+            "No episodes selected. Check --start-index/--end-index/--task/"
+            "--max-episodes-per-task/--max-episodes."
+        )
 
     n_shards = math.ceil(len(indices) / args.shard_size)
     print(
         f"Selected episodes: {len(indices)} | shard_size: {args.shard_size} | "
         f"output shards: {n_shards}"
     )
+    if args.task is not None:
+        print(f"Task filter: {args.task}")
     print(
         f"Cameras: third={args.third_camera}, gripper={args.gripper_camera} | "
         f"resolution={args.width}x{args.height} | fps={args.fps}"
@@ -537,7 +725,8 @@ def main():
 
     env_by_task: Dict[str, object] = {}
     renderer_by_task: Dict[str, mujoco.Renderer] = {}
-    category_ids_by_task: Dict[str, Tuple[set[int], set[int]]] = {}
+    body_flags_by_task: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    packed_id_cache_by_task: Dict[str, Dict[int, Tuple[bool, bool]]] = {}
 
     try:
         for shard_idx in range(n_shards):
@@ -564,7 +753,8 @@ def main():
                     if env is None or renderer is None:
                         env = _make_env(task)
                         env_by_task[task] = env
-                        category_ids_by_task[task] = _build_category_id_sets(env.model)
+                        body_flags_by_task[task] = _build_body_category_flags(env.model)
+                        packed_id_cache_by_task[task] = {0: (True, False)}
                         if third_cam_pos_xyz is not None:
                             _set_camera_position(env, args.third_camera, third_cam_pos_xyz)
                         try:
@@ -618,9 +808,25 @@ def main():
                     grip_rgbs = np.stack(grip_rgbs, axis=0)
                     third_masks = np.stack(third_masks, axis=0).astype(np.int32)
                     grip_masks = np.stack(grip_masks, axis=0).astype(np.int32)
-                    bg_ids, agent_ids = category_ids_by_task[task]
+                    third_masks = _normalize_packed_instance_mask(third_masks)
+                    grip_masks = _normalize_packed_instance_mask(grip_masks)
+                    bg_body, agent_body = body_flags_by_task[task]
+                    packed_id_cache = packed_id_cache_by_task[task]
+                    bg_ids, agent_ids = _resolve_category_sets_for_masks(
+                        [third_masks, grip_masks],
+                        model=env.model,
+                        bg_body=bg_body,
+                        agent_body=agent_body,
+                        packed_id_cache=packed_id_cache,
+                    )
                     third_cat_masks = _instance_to_category_mask(third_masks, bg_ids, agent_ids)
                     grip_cat_masks = _instance_to_category_mask(grip_masks, bg_ids, agent_ids)
+                    third_robot_masks, third_nonrobot_masks = _instance_to_robot_nonrobot_masks(
+                        third_masks, agent_ids
+                    )
+                    grip_robot_masks, grip_nonrobot_masks = _instance_to_robot_nonrobot_masks(
+                        grip_masks, agent_ids
+                    )
 
                     third_video_bytes = _encode_mp4_bytes(third_rgbs, fps=args.fps)
                     grip_video_bytes = _encode_mp4_bytes(grip_rgbs, fps=args.fps)
@@ -628,6 +834,14 @@ def main():
                     grip_mask_bytes = _encode_mask_npz_bytes(grip_masks)
                     third_cat_mask_bytes = _encode_mask_npz_bytes(third_cat_masks.astype(np.int32))
                     grip_cat_mask_bytes = _encode_mask_npz_bytes(grip_cat_masks.astype(np.int32))
+                    third_robot_mask_bytes = _encode_mask_npz_bytes(third_robot_masks.astype(np.int32))
+                    grip_robot_mask_bytes = _encode_mask_npz_bytes(grip_robot_masks.astype(np.int32))
+                    third_nonrobot_mask_bytes = _encode_mask_npz_bytes(
+                        third_nonrobot_masks.astype(np.int32)
+                    )
+                    grip_nonrobot_mask_bytes = _encode_mask_npz_bytes(
+                        grip_nonrobot_masks.astype(np.int32)
+                    )
 
                     rows_out.append(
                         {
@@ -641,6 +855,10 @@ def main():
                             "mask_gripper": grip_mask_bytes,
                             "mask_cat_third": third_cat_mask_bytes,
                             "mask_cat_gripper": grip_cat_mask_bytes,
+                            "mask_robot_third": third_robot_mask_bytes,
+                            "mask_robot_gripper": grip_robot_mask_bytes,
+                            "mask_nonrobot_third": third_nonrobot_mask_bytes,
+                            "mask_nonrobot_gripper": grip_nonrobot_mask_bytes,
                             "states": row["states"],
                             "actions": row["actions"],
                             "rewards": row["rewards"],

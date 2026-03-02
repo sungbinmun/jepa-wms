@@ -5,13 +5,29 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Render 1x4 grid videos from Metaworld multi-view parquet dataset.
+"""Render grid videos from Metaworld multi-view parquet dataset.
 
-Grid order:
+`instance` mode (1x4):
 1) third-person RGB
-2) third-person GT segmentation mask
+2) third-person GT instance mask
 3) gripper RGB
-4) gripper GT segmentation mask
+4) gripper GT instance mask
+
+`robot_nonrobot` mode (1x6):
+1) third-person RGB
+2) third-person robot mask overlay
+3) third-person non-robot mask overlay
+4) gripper RGB
+5) gripper robot mask overlay
+6) gripper non-robot mask overlay
+
+`robot_nonrobot_binary` mode (1x6):
+1) third-person RGB
+2) third-person robot binary mask
+3) third-person non-robot binary mask
+4) gripper RGB
+5) gripper robot binary mask
+6) gripper non-robot binary mask
 """
 
 from __future__ import annotations
@@ -123,6 +139,28 @@ def _mask_to_rgb(mask_hw: np.ndarray, palette: Dict[int, np.ndarray], draw_bound
     return rgb
 
 
+def _overlay_binary_mask(
+    rgb: np.ndarray,
+    mask_hw: np.ndarray,
+    color: tuple[int, int, int],
+    alpha: float = 0.6,
+    draw_boundaries: bool = True,
+) -> np.ndarray:
+    base = rgb.astype(np.float32).copy()
+    mask = mask_hw.astype(bool)
+    color_arr = np.array(color, dtype=np.float32)
+    base[mask] = (1.0 - alpha) * base[mask] + alpha * color_arr
+    out = np.clip(base, 0.0, 255.0).astype(np.uint8)
+    if draw_boundaries:
+        out = _overlay_mask_boundaries(out, mask.astype(np.int32))
+    return out
+
+
+def _binary_mask_to_rgb(mask_hw: np.ndarray) -> np.ndarray:
+    mask = (mask_hw > 0).astype(np.uint8) * 255
+    return np.repeat(mask[..., None], 3, axis=2)
+
+
 def _resize_like(img: np.ndarray, h: int, w: int) -> np.ndarray:
     if img.shape[0] == h and img.shape[1] == w:
         return img
@@ -138,33 +176,114 @@ def _render_one(
     fps: int,
     max_frames: Optional[int],
     draw_boundaries: bool,
+    mode: str,
 ) -> int:
     third_rgb = _decode_video(row["video_third"])
     gripper_rgb = _decode_video(row["video_gripper"])
-    third_mask = _decode_mask(row["mask_third"])
-    gripper_mask = _decode_mask(row["mask_gripper"])
 
-    n = min(len(third_rgb), len(gripper_rgb), len(third_mask), len(gripper_mask))
+    h, w = third_rgb[0].shape[:2]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if mode == "instance":
+        third_mask = _decode_mask(row["mask_third"])
+        gripper_mask = _decode_mask(row["mask_gripper"])
+
+        n = min(len(third_rgb), len(gripper_rgb), len(third_mask), len(gripper_mask))
+        if max_frames is not None and max_frames > 0:
+            n = min(n, int(max_frames))
+        if n <= 0:
+            raise ValueError("No frames available to render.")
+
+        label_palette = _build_label_palette(
+            np.concatenate([third_mask.reshape(-1), gripper_mask.reshape(-1)], axis=0)
+        )
+        with imageio.get_writer(str(out_path), fps=fps, macro_block_size=1) as writer:
+            for t in range(n):
+                rgb_t = third_rgb[t].astype(np.uint8)
+                rgb_g = _resize_like(gripper_rgb[t].astype(np.uint8), h, w)
+                mask_t = _mask_to_rgb(
+                    third_mask[t], palette=label_palette, draw_boundaries=draw_boundaries
+                )
+                mask_g = _resize_like(
+                    _mask_to_rgb(gripper_mask[t], palette=label_palette, draw_boundaries=draw_boundaries),
+                    h,
+                    w,
+                )
+                frame = np.concatenate([rgb_t, mask_t, rgb_g, mask_g], axis=1)
+                writer.append_data(frame)
+        return n
+
+    if mode not in ("robot_nonrobot", "robot_nonrobot_binary"):
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    required = [
+        "mask_robot_third",
+        "mask_robot_gripper",
+        "mask_nonrobot_third",
+        "mask_nonrobot_gripper",
+    ]
+    missing = [c for c in required if c not in row]
+    if missing:
+        raise KeyError(f"Missing required columns for mode=robot_nonrobot: {missing}")
+
+    robot_t = _decode_mask(row["mask_robot_third"]).astype(np.uint8)
+    robot_g = _decode_mask(row["mask_robot_gripper"]).astype(np.uint8)
+    nonrobot_t = _decode_mask(row["mask_nonrobot_third"]).astype(np.uint8)
+    nonrobot_g = _decode_mask(row["mask_nonrobot_gripper"]).astype(np.uint8)
+
+    n = min(
+        len(third_rgb),
+        len(gripper_rgb),
+        len(robot_t),
+        len(robot_g),
+        len(nonrobot_t),
+        len(nonrobot_g),
+    )
     if max_frames is not None and max_frames > 0:
         n = min(n, int(max_frames))
     if n <= 0:
         raise ValueError("No frames available to render.")
 
-    label_palette = _build_label_palette(
-        np.concatenate([third_mask.reshape(-1), gripper_mask.reshape(-1)], axis=0)
-    )
-
-    h, w = third_rgb[0].shape[:2]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(str(out_path), fps=fps, macro_block_size=1) as writer:
         for t in range(n):
             rgb_t = third_rgb[t].astype(np.uint8)
             rgb_g = _resize_like(gripper_rgb[t].astype(np.uint8), h, w)
-            mask_t = _mask_to_rgb(third_mask[t], palette=label_palette, draw_boundaries=draw_boundaries)
-            mask_g = _resize_like(
-                _mask_to_rgb(gripper_mask[t], palette=label_palette, draw_boundaries=draw_boundaries), h, w
+            if mode == "robot_nonrobot":
+                robot_t_vis = _overlay_binary_mask(
+                    rgb_t, robot_t[t], color=(255, 64, 64), draw_boundaries=draw_boundaries
+                )
+                nonrobot_t_vis = _overlay_binary_mask(
+                    rgb_t, nonrobot_t[t], color=(64, 200, 255), draw_boundaries=draw_boundaries
+                )
+                robot_g_vis = _resize_like(
+                    _overlay_binary_mask(
+                        gripper_rgb[t].astype(np.uint8),
+                        robot_g[t],
+                        color=(255, 64, 64),
+                        draw_boundaries=draw_boundaries,
+                    ),
+                    h,
+                    w,
+                )
+                nonrobot_g_vis = _resize_like(
+                    _overlay_binary_mask(
+                        gripper_rgb[t].astype(np.uint8),
+                        nonrobot_g[t],
+                        color=(64, 200, 255),
+                        draw_boundaries=draw_boundaries,
+                    ),
+                    h,
+                    w,
+                )
+            else:
+                robot_t_vis = _binary_mask_to_rgb(robot_t[t])
+                nonrobot_t_vis = _binary_mask_to_rgb(nonrobot_t[t])
+                robot_g_vis = _resize_like(_binary_mask_to_rgb(robot_g[t]), h, w)
+                nonrobot_g_vis = _resize_like(_binary_mask_to_rgb(nonrobot_g[t]), h, w)
+
+            frame = np.concatenate(
+                [rgb_t, robot_t_vis, nonrobot_t_vis, rgb_g, robot_g_vis, nonrobot_g_vis], axis=1
             )
-            frame = np.concatenate([rgb_t, mask_t, rgb_g, mask_g], axis=1)
             writer.append_data(frame)
     return n
 
@@ -175,6 +294,13 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=_default_output_dir())
     parser.add_argument("--index", type=int, default=0, help="Start rollout index.")
     parser.add_argument("--count", type=int, default=1, help="How many rollouts to render.")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="instance",
+        choices=["instance", "robot_nonrobot", "robot_nonrobot_binary"],
+        help="Visualization mode.",
+    )
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument(
@@ -203,15 +329,16 @@ def main():
         row = ds[idx]
         task = _sanitize(row.get("task", "unknown_task"))
         episode = int(row.get("episode", -1))
-        out = args.output_dir / f"mw_mv_grid_idx{idx:05d}_{task}_ep{episode}.mp4"
+        out = args.output_dir / f"mw_mv_{args.mode}_idx{idx:05d}_{task}_ep{episode}.mp4"
         n = _render_one(
             row,
             out,
             fps=args.fps,
             max_frames=args.max_frames,
             draw_boundaries=not args.no_mask_boundary,
+            mode=args.mode,
         )
-        print(f"[ok] idx={idx} frames={n} -> {out}")
+        print(f"[ok] mode={args.mode} idx={idx} frames={n} -> {out}")
 
 
 if __name__ == "__main__":
