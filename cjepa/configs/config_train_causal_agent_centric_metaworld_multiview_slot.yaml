@@ -10,21 +10,21 @@ wandb:
   enable: true
   project: ocjepa
   entity: null
-  name: metaworld_cjepa
+  name: metaworld_mv_acjepa
 
 use_hungarian_matching: true
 hungarian_cost_type: mse
 
-dataset_name: metaworld_slot
-embedding_dir: /path/to/metaworld_slots.pkl
+dataset_name: metaworld_slot_multiview
+embedding_dir_gripper: /path/to/metaworld_gripper_slots.pkl
+embedding_dir_third: /path/to/metaworld_third_slots.pkl
 cache_dir: "~/.stable_worldmodel"
 action_dir: /path/to/metaworld_actions.pkl
 proprio_dir: /path/to/metaworld_proprio.pkl
 state_dir: /path/to/metaworld_states.pkl
 
-output_model_name: metaworld_cjepa_baseline
+output_model_name: metaworld_cjepa_agent_centric_multiview_slotcontrast
 resume_from_existing_ckpt: false
-training_type: video
 
 trainer:
   max_epochs: 30
@@ -40,9 +40,6 @@ seed: 42
 console_log_every_n_steps: 20
 console_log_single_line: true
 
-image_size: 224
-patch_size: 16
-
 n_steps: ${eval:'${dinowm.num_preds} + ${dinowm.history_size}'}
 frameskip: 5
 
@@ -52,21 +49,13 @@ dinowm:
   proprio_dim: 4
   proprio_embed_dim: 20
   action_dim: 4
-  action_embed_dim: 20
+  action_embed_dim: 10
 
 num_masked_slots: 2
 
-predictor:
-  depth: 6
-  heads: 8
-  mlp_dim: 2048
-  dim_head: 64
-  dropout: 0.1
-  emb_dropout: 0.0
-
 predictor_lr: 5e-4
-proprio_encoder_lr: 5e-4
 action_encoder_lr: 5e-4
+proprio_head_lr: 5e-4
 
 videosaur:
   NUM_SLOTS: 7
@@ -78,8 +67,23 @@ videosaur:
   BATCH_SIZE_PER_GPU: 32
   TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
   BASE_LR: 0.0001
-  SIM_WEIGHT: 0.1
-  SIM_TEMP: 0.15
+
+multiview:
+  num_views: 2
+  view_names: [gripper, third]
+  use_view_pe: true
+  use_slot_pe: true
+
+agent_centric:
+  action_embed_dim: 64
+  heads: 8
+  mlp_dim: 256
+  dropout: 0.1
+  stop_gradient_agent_to_object: true
+  masked_history_loss_weight: 1.0
+  proprio_loss_weight: 1.0
+  object_loss_weight: 1.0
+  agent_loss_weight: 1.0
 
 # Placeholder OC config kept for checkpoint object compatibility.
 model:

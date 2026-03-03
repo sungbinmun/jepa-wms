@@ -1,9 +1,10 @@
-"""Train agent-centric C-JEPA world model from pre-extracted slots.
+"""Train multi-view agent-centric C-JEPA world model from pre-extracted slots.
 
-This variant assumes the last slot is the agent slot (from segmentation-supervised
-SlotContrast training) and applies the following causal bias:
-1) agent(t+1) is predicted from agent(t) conditioned on action(t)
-2) non-agent(t+1) is predicted from non-agent(t), agent(t), and stopgrad(agent(t+1))
+Design:
+- Input slots are concatenated across views: (B, T, V*S, D)
+- Each view's last slot is treated as that view's agent slot
+- Agent transition: agent_v(t), action(t) -> agent_v(t+1)
+- Object transition: objects_v(t), [all views' agents(t), stopgrad(agents(t+1))]
 """
 
 from pathlib import Path
@@ -23,23 +24,43 @@ from omegaconf import OmegaConf
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from src.agent_centric_predictor import AgentCausalSlotPredictor
-from src.custom_codes.custom_dataset import PushTSlotDataset
+from src.custom_codes.custom_dataset import PushTSlotMultiViewDataset
 from src.custom_codes.hungarian import hungarian_matching_loss_AP
+from src.multi_view_agent_centric_predictor import MultiViewAgentCausalSlotPredictor
 from src.third_party.videosaur.videosaur import models
 from src.world_models.dinowm_causal import CausalWM, Embedder
 
 import pickle as pkl
 
 
-def get_data(cfg):
-    """Setup dataset with pre-extracted slot representations."""
-    with open(cfg.embedding_dir, "rb") as f:
-        slot_data = pkl.load(f)
-    logging.info(f"Loaded slot embeddings from {cfg.embedding_dir}")
+def _get_view_slot_paths(cfg):
+    view_names = list(cfg.multiview.get("view_names", ["gripper", "third"]))
+    paths = {}
+    for view_name in view_names:
+        key = f"embedding_dir_{view_name}"
+        if key not in cfg:
+            raise KeyError(
+                f"Missing config key `{key}` for view `{view_name}`. "
+                "Add embedding_dir_<view_name> to config/overrides."
+            )
+        paths[view_name] = cfg[key]
+    return view_names, paths
 
-    train_dataset = PushTSlotDataset(
-        slot_data=slot_data["train"],
+
+def get_data(cfg):
+    """Setup multi-view dataset with pre-extracted slot representations."""
+    view_names, view_paths = _get_view_slot_paths(cfg)
+    slot_data_by_view = {}
+    for view_name in view_names:
+        with open(view_paths[view_name], "rb") as f:
+            slot_data_by_view[view_name] = pkl.load(f)
+        logging.info(f"Loaded {view_name} slot embeddings from {view_paths[view_name]}")
+
+    train_slot_data = {view_name: slot_data_by_view[view_name]["train"] for view_name in view_names}
+    val_slot_data = {view_name: slot_data_by_view[view_name]["val"] for view_name in view_names}
+
+    train_dataset = PushTSlotMultiViewDataset(
+        slot_data_views=train_slot_data,
         split="train",
         history_size=cfg.dinowm.history_size,
         num_preds=cfg.dinowm.num_preds,
@@ -49,8 +70,8 @@ def get_data(cfg):
         frameskip=cfg.frameskip,
         seed=cfg.seed,
     )
-    val_dataset = PushTSlotDataset(
-        slot_data=slot_data["val"],
+    val_dataset = PushTSlotMultiViewDataset(
+        slot_data_views=val_slot_data,
         split="val",
         history_size=cfg.dinowm.history_size,
         num_preds=cfg.dinowm.num_preds,
@@ -85,9 +106,16 @@ def get_data(cfg):
 
 
 def get_world_model(cfg):
-    """Build world model with agent-centric transition structure."""
+    """Build multi-view agent-centric world model."""
+    view_names, _ = _get_view_slot_paths(cfg)
+    num_views = int(cfg.multiview.get("num_views", len(view_names)))
+    if num_views != len(view_names):
+        raise ValueError(
+            f"multiview.num_views={num_views} does not match len(view_names)={len(view_names)}"
+        )
+    slots_per_view = int(cfg.videosaur.NUM_SLOTS)
 
-    def _get_object_mask_indices(num_object_slots: int, device: torch.device) -> torch.Tensor | None:
+    def _sample_object_mask_indices(num_object_slots: int, device: torch.device):
         num_masked_slots = int(cfg.get("num_masked_slots", 0))
         if num_masked_slots <= 0 or num_object_slots <= 0:
             return None
@@ -95,9 +123,20 @@ def get_world_model(cfg):
         rng = torch.Generator(device="cpu").manual_seed(int(cfg.seed))
         return torch.randperm(num_object_slots, generator=rng)[:n_mask].to(device)
 
+    def _reshape_view_slots(x: torch.Tensor, num_steps: int) -> torch.Tensor:
+        # (B, T, V*S, D) -> (B, T, V, S, D)
+        bsz, _, total_slots, dim = x.shape
+        expected = num_views * slots_per_view
+        if total_slots != expected:
+            raise ValueError(
+                f"Expected {expected} slots (num_views={num_views}, slots_per_view={slots_per_view}), "
+                f"got {total_slots}"
+            )
+        return x.reshape(bsz, num_steps, num_views, slots_per_view, dim)
+
     def forward(self, batch, stage):
-        action = torch.nan_to_num(batch["action"].float(), 0.0)  # (B, T, act_dim*frameskip)
-        pixels_embed = batch["pixels_embed"].float()  # (B, T, S, D)
+        action = torch.nan_to_num(batch["action"].float(), 0.0)  # (B, T, action_dim*frameskip)
+        pixels_embed = batch["pixels_embed"].float()  # (B, T, V*S, D)
 
         history_size = int(cfg.dinowm.history_size)
         num_preds = int(cfg.dinowm.num_preds)
@@ -109,71 +148,90 @@ def get_world_model(cfg):
                 f"need at least {history_size + num_preds - 1}."
             )
 
-        target_future = pixels_embed[:, history_size : history_size + num_preds, :, :]
         history_slots = pixels_embed[:, :history_size, :, :]
+        target_future = pixels_embed[:, history_size : history_size + num_preds, :, :]
+        target_future_view = _reshape_view_slots(target_future, num_preds)
+        target_obj = target_future_view[:, :, :, :-1, :]  # (B, T_pred, V, S-1, D)
+        target_agent = target_future_view[:, :, :, -1, :]  # (B, T_pred, V, D)
 
-        # Action at source step t drives transition t -> t+1.
-        # For targets [history_size ... history_size+num_preds-1], source steps are
-        # [history_size-1 ... history_size+num_preds-2].
         action_embed = self.model.action_encoder(action)
         future_action_embed = action_embed[:, history_size - 1 : history_size - 1 + num_preds, :]
-
         pred_future, aux = self.model.predictor(history_slots, future_action_embed)
-        batch["pred_future"] = pred_future
-        batch["pred_object_slots"] = aux["pred_object_slots"]
-        batch["pred_agent_slots"] = aux["pred_agent_slots"]
+        pred_obj = aux["pred_object_slots"]  # (B, T_pred, V, S-1, D)
+        pred_agent = aux["pred_agent_slots"]  # (B, T_pred, V, D)
 
-        # C-JEPA-style masked history loss: predict transitions inside history
-        # and apply loss on masked object slots only.
+        batch["pred_future"] = pred_future
+        batch["pred_object_slots"] = pred_obj
+        batch["pred_agent_slots"] = pred_agent
+
+        # C-JEPA-style masked history loss on masked object slots.
         loss_masked_history = pixels_embed.new_tensor(0.0)
         if history_size > 1:
             history_action_embed = action_embed[:, : history_size - 1, :]
-            _, history_aux = self.model.predictor.rollout(history_slots[:, 0, :, :], history_action_embed)
-            target_history_obj = history_slots[:, 1:history_size, :-1, :]
-            mask_indices = _get_object_mask_indices(target_history_obj.size(2), target_history_obj.device)
+            _, hist_aux = self.model.predictor.rollout(history_slots[:, 0, :, :], history_action_embed)
+            hist_pred_obj = hist_aux["pred_object_slots"]  # (B, T_hist-1, V, S-1, D)
+
+            hist_target = history_slots[:, 1:history_size, :, :]
+            hist_target_view = _reshape_view_slots(hist_target, history_size - 1)
+            hist_target_obj = hist_target_view[:, :, :, :-1, :]
+
+            mask_indices = _sample_object_mask_indices(hist_target_obj.size(3), hist_target_obj.device)
             if mask_indices is not None and mask_indices.numel() > 0:
                 loss_masked_history = F.mse_loss(
-                    history_aux["pred_object_slots"][:, :, mask_indices, :],
-                    target_history_obj[:, :, mask_indices, :].detach(),
+                    hist_pred_obj[:, :, :, mask_indices, :],
+                    hist_target_obj[:, :, :, mask_indices, :].detach(),
                 )
             else:
-                loss_masked_history = F.mse_loss(
-                    history_aux["pred_object_slots"],
-                    target_history_obj.detach(),
-                )
+                loss_masked_history = F.mse_loss(hist_pred_obj, hist_target_obj.detach())
         batch["loss_masked_history"] = loss_masked_history
-
-        target_obj = target_future[:, :, :-1, :]
-        target_agent = target_future[:, :, -1, :]
 
         use_hungarian = bool(cfg.get("use_hungarian_matching", True))
         hungarian_cost_type = str(cfg.get("hungarian_cost_type", "mse"))
-        if use_hungarian:
-            object_loss = hungarian_matching_loss_AP(
-                pred=aux["pred_object_slots"],
-                target=target_obj.detach(),
-                cost_type=hungarian_cost_type,
-                reduction="mean",
-            )["pixels_loss"]
-            with torch.no_grad():
-                batch["direct_mse_object_loss"] = F.mse_loss(aux["pred_object_slots"], target_obj.detach())
-        else:
-            object_loss = F.mse_loss(aux["pred_object_slots"], target_obj.detach())
 
-        agent_loss = F.mse_loss(aux["pred_agent_slots"], target_agent.detach())
+        object_losses = []
+        direct_object_losses = []
+        for v_idx, view_name in enumerate(view_names):
+            pred_obj_v = pred_obj[:, :, v_idx, :, :]
+            target_obj_v = target_obj[:, :, v_idx, :, :]
+            if use_hungarian:
+                loss_obj_v = hungarian_matching_loss_AP(
+                    pred=pred_obj_v,
+                    target=target_obj_v.detach(),
+                    cost_type=hungarian_cost_type,
+                    reduction="mean",
+                )["pixels_loss"]
+            else:
+                loss_obj_v = F.mse_loss(pred_obj_v, target_obj_v.detach())
+            object_losses.append(loss_obj_v)
+            batch[f"object_loss_{view_name}"] = loss_obj_v
+
+            with torch.no_grad():
+                direct_v = F.mse_loss(pred_obj_v, target_obj_v.detach())
+            direct_object_losses.append(direct_v)
+            batch[f"direct_mse_object_loss_{view_name}"] = direct_v
+
+        object_loss = torch.stack(object_losses).mean()
+        batch["object_loss"] = object_loss
+        batch["direct_mse_object_loss"] = torch.stack(direct_object_losses).mean()
+
+        agent_losses = []
+        for v_idx, view_name in enumerate(view_names):
+            agent_loss_v = F.mse_loss(pred_agent[:, :, v_idx, :], target_agent[:, :, v_idx, :].detach())
+            agent_losses.append(agent_loss_v)
+            batch[f"agent_loss_{view_name}"] = agent_loss_v
+        agent_loss = torch.stack(agent_losses).mean()
+        batch["agent_loss"] = agent_loss
+
         object_weight = float(cfg.agent_centric.get("object_loss_weight", 1.0))
         agent_weight = float(cfg.agent_centric.get("agent_loss_weight", 1.0))
         loss_future = object_weight * object_loss + agent_weight * agent_loss
-
-        batch["object_loss"] = object_loss
-        batch["agent_loss"] = agent_loss
         batch["loss_future"] = loss_future
 
-        # Optional proprio loss from predicted agent slot.
         if "proprio" in batch and hasattr(self.model, "proprio_head"):
             proprio = torch.nan_to_num(batch["proprio"].float(), 0.0)
             target_proprio = proprio[:, history_size : history_size + num_preds, :]
-            pred_proprio = self.model.proprio_head(aux["pred_agent_slots"])
+            pred_proprio = self.model.proprio_head(pred_agent)  # (B, T_pred, V, proprio_dim)
+            target_proprio = target_proprio.unsqueeze(2).expand(-1, -1, num_views, -1)
             proprio_loss = F.mse_loss(pred_proprio, target_proprio.detach())
             batch["proprio_loss"] = proprio_loss
         else:
@@ -186,7 +244,6 @@ def get_world_model(cfg):
             total_loss = total_loss + proprio_weight * proprio_loss
         batch["loss"] = total_loss
 
-        # Keep same monitoring key pattern as existing training scripts.
         pred_flat = rearrange(pred_future, "b t s d -> (b t) (s d)")
         batch["predictor_embed"] = pred_flat
 
@@ -195,7 +252,6 @@ def get_world_model(cfg):
         self.log_dict(losses_dict, on_step=True, sync_dist=True)
         return batch
 
-    # Build placeholders for checkpoint compatibility with existing CausalWM object format.
     placeholder_model = models.build(cfg.model, cfg.dummy_optimizer, None, None)
     encoder = placeholder_model.encoder
     slot_attention = placeholder_model.processor
@@ -204,16 +260,19 @@ def get_world_model(cfg):
     slot_dim = int(cfg.videosaur.SLOT_DIM)
     effective_act_dim = int(cfg.frameskip * cfg.dinowm.action_dim)
     action_embed_dim = int(cfg.agent_centric.get("action_embed_dim", slot_dim))
-
-    predictor = AgentCausalSlotPredictor(
+    predictor = MultiViewAgentCausalSlotPredictor(
         slot_dim=slot_dim,
         action_dim=action_embed_dim,
+        num_views=num_views,
+        slots_per_view=slots_per_view,
         num_heads=int(cfg.agent_centric.get("heads", 8)),
         mlp_dim=int(cfg.agent_centric.get("mlp_dim", 256)),
         dropout=float(cfg.agent_centric.get("dropout", 0.1)),
         stop_gradient_agent_to_object=bool(
             cfg.agent_centric.get("stop_gradient_agent_to_object", True)
         ),
+        use_view_pe=bool(cfg.multiview.get("use_view_pe", True)),
+        use_slot_pe=bool(cfg.multiview.get("use_slot_pe", True)),
     )
     action_encoder = Embedder(in_chans=effective_act_dim, emb_dim=action_embed_dim)
 
@@ -252,7 +311,7 @@ def setup_pl_logger(cfg):
     wandb_run_id = cfg.wandb.get("run_id", None)
     wandb_entity = os.environ.get("WANDB_ENTITY", cfg.wandb.get("entity", None))
     wandb_project = os.environ.get("WANDB_PROJECT", cfg.wandb.get("project", "ocjepa"))
-    wandb_name = os.environ.get("WANDB_NAME", cfg.wandb.get("name", "cjepa_agent_centric"))
+    wandb_name = os.environ.get("WANDB_NAME", cfg.wandb.get("name", "mv_acjepa"))
     wandb_logger = WandbLogger(
         name=wandb_name,
         project=wandb_project,
@@ -316,7 +375,14 @@ class ConsoleLossCallback(Callback):
 
         tracked = {}
         if isinstance(outputs, dict):
-            for key in ("loss", "loss_future", "loss_masked_history", "proprio_loss", "object_loss", "agent_loss"):
+            for key in (
+                "loss",
+                "loss_future",
+                "loss_masked_history",
+                "proprio_loss",
+                "object_loss",
+                "agent_loss",
+            ):
                 val = self._to_float(outputs.get(key))
                 if val is not None:
                     tracked[key] = val
@@ -357,7 +423,7 @@ class ConsoleLossCallback(Callback):
 @hydra.main(
     version_base=None,
     config_path="../../configs",
-    config_name="config_train_causal_agent_centric_pusht_slot",
+    config_name="config_train_causal_agent_centric_metaworld_multiview_slot",
 )
 def run(cfg):
     cache_dir_raw = swm.data.utils.get_cache_dir() if cfg.cache_dir is None else cfg.cache_dir

@@ -14,6 +14,7 @@ The checkpoint format is identical to train_causalwm.py to ensure
 compatibility with downstream tasks.
 """
 from pathlib import Path
+from datetime import datetime
 
 import hydra
 import lightning as pl
@@ -326,6 +327,17 @@ def get_world_model(cfg):
     embedding_dim = slot_dim + cfg.dinowm.proprio_embed_dim + cfg.dinowm.action_embed_dim
     
     logging.info(f"Num slots: {num_slots}, Slot dim: {slot_dim}, Total embedding dim: {embedding_dim}")
+
+    requested_heads = int(cfg.predictor.get("heads", 16))
+    predictor_heads = requested_heads
+    if embedding_dim % predictor_heads != 0:
+        # Pick the largest valid head count <= requested_heads.
+        valid_heads = [h for h in range(min(requested_heads, embedding_dim), 0, -1) if embedding_dim % h == 0]
+        predictor_heads = valid_heads[0] if valid_heads else 1
+        logging.warning(
+            f"predictor.heads={requested_heads} is incompatible with embedding_dim={embedding_dim}; "
+            f"using heads={predictor_heads} instead."
+        )
     
     # Build masked slot predictor (same as train_causalwm.py)
     predictor = MaskedSlotPredictor(
@@ -336,7 +348,7 @@ def get_world_model(cfg):
         num_masked_slots=cfg.get("num_masked_slots", 2),
         seed=cfg.seed,
         depth=cfg.predictor.get("depth", 6),
-        heads=cfg.predictor.get("heads", 16),
+        heads=predictor_heads,
         dim_head=cfg.predictor.get("dim_head", 64),
         mlp_dim=cfg.predictor.get("mlp_dim", 2048),
         dropout=cfg.predictor.get("dropout", 0.1),
@@ -344,8 +356,8 @@ def get_world_model(cfg):
     
     # Build action and proprioception encoders (will be trained)
     effective_act_dim = cfg.frameskip * cfg.dinowm.action_dim
-    action_encoder = swm.wm.dinowm.Embedder(in_chans=effective_act_dim, emb_dim=cfg.dinowm.action_embed_dim)
-    proprio_encoder = swm.wm.dinowm.Embedder(in_chans=cfg.dinowm.proprio_dim, emb_dim=cfg.dinowm.proprio_embed_dim)
+    action_encoder = Embedder(in_chans=effective_act_dim, emb_dim=cfg.dinowm.action_embed_dim)
+    proprio_encoder = Embedder(in_chans=cfg.dinowm.proprio_dim, emb_dim=cfg.dinowm.proprio_embed_dim)
 
     logging.info(f"Action dim: {effective_act_dim}, Proprio dim: {cfg.dinowm.proprio_dim}")
 
@@ -387,10 +399,13 @@ def setup_pl_logger(cfg):
         return None
     
     wandb_run_id = cfg.wandb.get("run_id", None)
+    wandb_entity = os.environ.get("WANDB_ENTITY", cfg.wandb.get("entity", None))
+    wandb_project = os.environ.get("WANDB_PROJECT", cfg.wandb.get("project", "ocjepa"))
+    wandb_name = os.environ.get("WANDB_NAME", cfg.wandb.get("name", "dino_wm_slot"))
     wandb_logger = WandbLogger(
-        name="dino_wm_slot",
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
+        name=wandb_name,
+        project=wandb_project,
+        entity=wandb_entity,
         resume="allow" if wandb_run_id else None,
         id=wandb_run_id,
         log_model=False,
@@ -425,6 +440,65 @@ class ModelObjectCallBack(Callback):
                 logging.info(f"Saved final world model object to {final_path}")
 
 
+class ConsoleLossCallback(Callback):
+    """Print training progress/loss to terminal during an epoch."""
+
+    def __init__(self, every_n_steps: int = 20, single_line: bool = False):
+        super().__init__()
+        self.every_n_steps = max(1, int(every_n_steps))
+        self.single_line = bool(single_line)
+
+    @staticmethod
+    def _to_float(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().mean().cpu())
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        if not trainer.is_global_zero:
+            return
+        global_step = int(trainer.global_step)
+        if global_step == 0 or global_step % self.every_n_steps != 0:
+            return
+
+        tracked = {}
+        if isinstance(outputs, dict):
+            for key in ("loss", "loss_future", "loss_masked_history", "proprio_loss"):
+                val = self._to_float(outputs.get(key))
+                if val is not None:
+                    tracked[key] = val
+
+        if "loss" not in tracked:
+            for key in ("train/loss", "train/loss_future", "train/loss_masked_history", "train/proprio_loss"):
+                val = self._to_float(trainer.callback_metrics.get(key))
+                if val is not None:
+                    tracked[key.split("/", 1)[-1]] = val
+
+        num_batches = trainer.num_training_batches
+        batch_prog = (
+            f"{batch_idx + 1}/{num_batches}"
+            if isinstance(num_batches, int) and num_batches > 0
+            else f"{batch_idx + 1}"
+        )
+        msg = f"[train] epoch={trainer.current_epoch + 1} step={global_step} batch={batch_prog}"
+        for key in ("loss", "loss_future", "loss_masked_history", "proprio_loss"):
+            if key in tracked:
+                msg += f" {key}={tracked[key]:.6f}"
+        if self.single_line:
+            print(f"\r{msg}", end="", flush=True)
+        else:
+            logging.info(msg)
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if self.single_line and trainer.is_global_zero:
+            print("", flush=True)
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
@@ -433,8 +507,20 @@ def run(cfg):
     """Run training of predictor using pre-extracted slot representations."""
     
     # Setup cache directory
-    cache_dir = Path(swm.data.utils.get_cache_dir() if cfg.cache_dir is None else cfg.cache_dir)
+    cache_dir_raw = swm.data.utils.get_cache_dir() if cfg.cache_dir is None else cfg.cache_dir
+    cache_dir = Path(cache_dir_raw).expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = cache_dir / f"{cfg.output_model_name}_weights.ckpt"
+    resume_from_existing_ckpt = bool(cfg.get("resume_from_existing_ckpt", False))
+    if ckpt_path.is_file() and not resume_from_existing_ckpt:
+        backup = ckpt_path.with_name(
+            f"{ckpt_path.stem}.backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.ckpt"
+        )
+        ckpt_path.rename(backup)
+        logging.warning(
+            f"Found existing checkpoint at {ckpt_path}. "
+            f"resume_from_existing_ckpt=false, moved to backup: {backup}"
+        )
     
     # Setup logging
     wandb_logger = setup_pl_logger(cfg)
@@ -452,7 +538,15 @@ def run(cfg):
         epoch_interval=1,
     )
     
-    callbacks = [dump_object_callback]
+    callbacks = [
+        dump_object_callback,
+        ConsoleLossCallback(
+            every_n_steps=int(
+                cfg.get("console_log_every_n_steps", cfg.trainer.get("log_every_n_steps", 20))
+            ),
+            single_line=bool(cfg.get("console_log_single_line", True)),
+        ),
+    ]
     
 
     
@@ -470,7 +564,7 @@ def run(cfg):
         trainer=trainer,
         module=world_model,
         data=data,
-        ckpt_path=str(cache_dir / f"{cfg.output_model_name}_weights.ckpt"),
+        ckpt_path=str(ckpt_path),
         seed=cfg.seed,
     )
     manager()

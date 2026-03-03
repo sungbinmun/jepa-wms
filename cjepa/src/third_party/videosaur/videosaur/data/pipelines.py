@@ -6,7 +6,11 @@ import numpy as np
 import tempfile
 import os
 import cv2
-from torchcodec.decoders import VideoDecoder
+try:
+    from torchcodec.decoders import VideoDecoder
+except Exception:
+    # Keep import-time robust when torch/torchcodec native ABI is mismatched.
+    VideoDecoder = None
 
 import webdataset as wds
 
@@ -274,14 +278,15 @@ def ensure_video_array(dictionary: Dict[str, Any], keys_to_ensure: Tuple[str]) -
                     fh.write(val)
 
                 frames_np = None
-                # Try torchcodec first (if available)
-                try:
-                    dec = VideoDecoder(tmp_path)
-                    frames_t = dec[:]
-                    if frames_t is not None and len(frames_t) > 0:
-                        frames_np = frames_t.permute(0, 2, 3, 1).cpu().numpy()
-                except Exception:
-                    frames_np = None
+                # Try torchcodec first (if available and importable)
+                if VideoDecoder is not None:
+                    try:
+                        dec = VideoDecoder(tmp_path)
+                        frames_t = dec[:]
+                        if frames_t is not None and len(frames_t) > 0:
+                            frames_np = frames_t.permute(0, 2, 3, 1).cpu().numpy()
+                    except Exception:
+                        frames_np = None
 
                 # Fallback to OpenCV
                 if frames_np is None:

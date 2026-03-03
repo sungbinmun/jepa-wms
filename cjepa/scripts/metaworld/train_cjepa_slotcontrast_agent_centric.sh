@@ -27,6 +27,17 @@ if [[ ! -f "${SLOTPATH}" || ! -f "${ACTION_PATH}" || ! -f "${PROPRIO_PATH}" || !
     --device cuda
 fi
 
+WANDB_OVERRIDES=()
+if [[ -n "${WANDB_ENTITY:-}" ]]; then
+  WANDB_OVERRIDES+=(wandb.entity="${WANDB_ENTITY}")
+fi
+if [[ -n "${WANDB_PROJECT:-}" ]]; then
+  WANDB_OVERRIDES+=(wandb.project="${WANDB_PROJECT}")
+fi
+if [[ -n "${WANDB_NAME:-}" ]]; then
+  WANDB_OVERRIDES+=(wandb.name="${WANDB_NAME}")
+fi
+
 python3 src/train/train_causalwm_agent_centric_from_pusht_slot.py \
   --config-name config_train_causal_agent_centric_pusht_slot \
   output_model_name="metaworld_cjepa_agent_centric_slotcontrast" \
@@ -40,4 +51,5 @@ python3 src/train/train_causalwm_agent_centric_from_pusht_slot.py \
   videosaur.SLOT_DIM=64 \
   agent_centric.action_embed_dim=64 \
   trainer.devices=1 \
-  trainer.strategy=auto
+  trainer.strategy=auto \
+  "${WANDB_OVERRIDES[@]}"

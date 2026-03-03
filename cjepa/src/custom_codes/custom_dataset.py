@@ -278,3 +278,161 @@ class PushTSlotDataset(Dataset):
         
         return sample
 
+
+class PushTSlotMultiViewDataset(Dataset):
+    """
+    Dataset for multi-view pre-extracted slot representations.
+
+    Each sample concatenates per-view slots on the slot axis:
+    - pixels_embed: (T, V*S, D)
+    - action: (T, action_dim * frameskip)
+    - proprio: (T, proprio_dim)
+    """
+
+    def __init__(
+        self,
+        slot_data_views: dict,
+        split: str,
+        history_size: int,
+        num_preds: int,
+        action_dir: str,
+        proprio_dir: str,
+        state_dir: str = None,
+        frameskip: int = 1,
+        seed: int = 42,
+    ):
+        super().__init__()
+        if not slot_data_views:
+            raise ValueError("slot_data_views is empty.")
+        self.slot_data_views = slot_data_views
+        self.view_names = list(slot_data_views.keys())
+        self.split = split
+        self.history_size = history_size
+        self.num_preds = num_preds
+        self.frameskip = frameskip
+        self.n_steps = history_size + num_preds
+        self.seed = seed
+
+        with open(action_dir, "rb") as f:
+            action_data = pkl.load(f)
+        self.action_data = action_data[split]
+
+        with open(proprio_dir, "rb") as f:
+            proprio_data = pkl.load(f)
+        self.proprio_data = proprio_data[split]
+
+        self.state_data = None
+        if state_dir is not None:
+            with open(state_dir, "rb") as f:
+                state_data = pkl.load(f)
+            self.state_data = state_data[split]
+
+        self.video_ids = self._build_common_video_ids()
+        self.video_num_frames = self._compute_video_num_frames()
+        self.samples = self._build_sample_index()
+        self._compute_normalization_stats()
+
+        logging.info(
+            f"[{split}] Multi-view dataset with {len(self.samples)} samples from "
+            f"{len(self.video_ids)} videos, views={self.view_names}"
+        )
+
+    def _build_common_video_ids(self):
+        common = set(self.action_data.keys()) & set(self.proprio_data.keys())
+        for view_name in self.view_names:
+            common &= set(self.slot_data_views[view_name].keys())
+        if self.state_data is not None:
+            common &= set(self.state_data.keys())
+        if not common:
+            raise RuntimeError("No common video ids across views/action/proprio/state.")
+        return sorted(common)
+
+    def _compute_video_num_frames(self):
+        lengths = {}
+        for video_id in self.video_ids:
+            per_modality_lengths = [
+                self.action_data[video_id].shape[0],
+                self.proprio_data[video_id].shape[0],
+            ]
+            if self.state_data is not None:
+                per_modality_lengths.append(self.state_data[video_id].shape[0])
+            for view_name in self.view_names:
+                per_modality_lengths.append(self.slot_data_views[view_name][video_id].shape[0])
+            lengths[video_id] = int(min(per_modality_lengths))
+        return lengths
+
+    def _build_sample_index(self):
+        samples = []
+        clip_len = self.n_steps * self.frameskip
+        for video_id in self.video_ids:
+            num_frames = self.video_num_frames[video_id]
+            max_start = num_frames - clip_len
+            if max_start < 0:
+                continue
+            for start_idx in range(0, max_start + 1):
+                samples.append((video_id, start_idx))
+        return samples
+
+    def _compute_normalization_stats(self):
+        all_actions = []
+        all_proprios = []
+        clip_len = self.n_steps * self.frameskip
+
+        for video_id in self.video_ids:
+            num_frames = self.video_num_frames[video_id]
+            action_raw = self.action_data[video_id]
+            proprio_raw = self.proprio_data[video_id]
+
+            for start_idx in range(0, num_frames - clip_len + 1):
+                action_clip = action_raw[start_idx : start_idx + clip_len]
+                action_reshaped = action_clip.reshape(self.n_steps, -1)
+                all_actions.append(action_reshaped)
+
+                frame_indices = [start_idx + i * self.frameskip for i in range(self.n_steps)]
+                proprio_clip = proprio_raw[frame_indices]
+                all_proprios.append(proprio_clip)
+
+        if not all_actions or not all_proprios:
+            raise RuntimeError("No valid windows found to compute normalization stats.")
+
+        all_actions = torch.from_numpy(np.concatenate(all_actions, axis=0)).float()
+        all_proprios = torch.from_numpy(np.concatenate(all_proprios, axis=0)).float()
+
+        self.action_mean = all_actions.mean(0).unsqueeze(0)
+        self.action_std = all_actions.std(0).unsqueeze(0)
+        self.proprio_mean = all_proprios.mean(0).unsqueeze(0)
+        self.proprio_std = all_proprios.std(0).unsqueeze(0)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        video_id, start_idx = self.samples[idx]
+        clip_len = self.n_steps * self.frameskip
+        frame_indices = [start_idx + i * self.frameskip for i in range(self.n_steps)]
+
+        view_slots = []
+        for view_name in self.view_names:
+            slots = self.slot_data_views[view_name][video_id]
+            view_slots.append(torch.from_numpy(slots[frame_indices]).float())  # (T, S, D)
+        pixels_embed = torch.cat(view_slots, dim=1)  # (T, V*S, D)
+
+        action_raw = self.action_data[video_id]
+        action_clip = action_raw[start_idx : start_idx + clip_len]
+        action = torch.from_numpy(action_clip.reshape(self.n_steps, -1)).float()
+
+        proprio_raw = self.proprio_data[video_id]
+        proprio = torch.from_numpy(proprio_raw[frame_indices]).float()
+
+        action = (action - self.action_mean) / self.action_std
+        proprio = (proprio - self.proprio_mean) / self.proprio_std
+
+        sample = {
+            "pixels_embed": pixels_embed,
+            "action": action,
+            "proprio": proprio,
+        }
+        if self.state_data is not None:
+            state_raw = self.state_data[video_id]
+            sample["state"] = torch.from_numpy(state_raw[frame_indices]).float()
+        return sample

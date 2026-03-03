@@ -116,6 +116,58 @@ class AgentCausalSlotPredictor(nn.Module):
         slots_next = torch.cat([non_agent_next, agent_next], dim=1)
         return slots_next, non_agent_next, agent_next
 
+    def rollout(
+        self,
+        start_slots: torch.Tensor,
+        action_seq: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Roll out the transition model for a sequence of actions.
+
+        Args:
+            start_slots: (B, S, D), source slots at the first transition step.
+            action_seq: (B, T, A), action embedding for each transition.
+        Returns:
+            pred_slots: (B, T, S, D)
+            aux: dict with
+                - pred_object_slots: (B, T, S-1, D)
+                - pred_agent_slots: (B, T, D)
+        """
+        if start_slots.ndim != 3:
+            raise ValueError(
+                f"start_slots must be (B, S, D), got {tuple(start_slots.shape)}"
+            )
+        if action_seq.ndim != 3:
+            raise ValueError(f"action_seq must be (B, T, A), got {tuple(action_seq.shape)}")
+        if start_slots.size(0) != action_seq.size(0):
+            raise ValueError("Batch size mismatch between start_slots and action_seq.")
+
+        current_slots = start_slots
+        pred_all = []
+        pred_obj = []
+        pred_agent = []
+        for t in range(action_seq.size(1)):
+            current_slots, obj_next, agent_next = self._predict_one_step(current_slots, action_seq[:, t, :])
+            pred_all.append(current_slots)
+            pred_obj.append(obj_next)
+            pred_agent.append(agent_next)
+
+        if len(pred_all) == 0:
+            bsz, num_slots, dim = start_slots.shape
+            pred_future_slots = start_slots.new_empty((bsz, 0, num_slots, dim))
+            pred_object_slots = start_slots.new_empty((bsz, 0, num_slots - 1, dim))
+            pred_agent_slots = start_slots.new_empty((bsz, 0, dim))
+        else:
+            pred_future_slots = torch.stack(pred_all, dim=1)  # (B, T, S, D)
+            pred_object_slots = torch.stack(pred_obj, dim=1)  # (B, T, S-1, D)
+            pred_agent_slots = torch.stack(pred_agent, dim=1).squeeze(2)  # (B, T, D)
+
+        aux = {
+            "pred_object_slots": pred_object_slots,
+            "pred_agent_slots": pred_agent_slots,
+        }
+        return pred_future_slots, aux
+
     def forward(
         self,
         history_slots: torch.Tensor,
@@ -140,24 +192,8 @@ class AgentCausalSlotPredictor(nn.Module):
         if history_slots.size(0) != future_actions.size(0):
             raise ValueError("Batch size mismatch between history_slots and future_actions.")
 
-        current_slots = history_slots[:, -1, :, :]  # use latest observed slots as transition source
-        pred_all = []
-        pred_obj = []
-        pred_agent = []
-        for t in range(future_actions.size(1)):
-            current_slots, obj_next, agent_next = self._predict_one_step(current_slots, future_actions[:, t, :])
-            pred_all.append(current_slots)
-            pred_obj.append(obj_next)
-            pred_agent.append(agent_next)
-
-        pred_future_slots = torch.stack(pred_all, dim=1)  # (B, T_pred, S, D)
-        pred_object_slots = torch.stack(pred_obj, dim=1)  # (B, T_pred, S-1, D)
-        pred_agent_slots = torch.stack(pred_agent, dim=1).squeeze(2)  # (B, T_pred, D)
-        aux = {
-            "pred_object_slots": pred_object_slots,
-            "pred_agent_slots": pred_agent_slots,
-        }
-        return pred_future_slots, aux
+        # Use the latest observed slots as the source for future transitions.
+        return self.rollout(history_slots[:, -1, :, :], future_actions)
 
     @torch.no_grad()
     def inference(self, history_slots: torch.Tensor, future_actions: torch.Tensor) -> torch.Tensor:

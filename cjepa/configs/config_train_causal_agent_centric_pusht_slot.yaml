@@ -8,9 +8,9 @@ hydra:
 
 wandb:
   enable: true
-  project: cjepa_agent_centric
-  entity: heejeong_nam-brown-university
-  name: metaworld_agent_centric
+  project: ocjepa
+  entity: null
+  name: metaworld_acjepa
 
 use_hungarian_matching: true
 hungarian_cost_type: mse
@@ -23,6 +23,7 @@ proprio_dir: /path/to/metaworld_proprio.pkl
 state_dir: /path/to/metaworld_states.pkl
 
 output_model_name: metaworld_agent_centric_cjepa
+resume_from_existing_ckpt: false
 
 trainer:
   max_epochs: 30
@@ -35,6 +36,8 @@ trainer:
 batch_size: 128
 num_workers: 8
 seed: 42
+console_log_every_n_steps: 20
+console_log_single_line: true
 
 n_steps: ${eval:'${dinowm.num_preds} + ${dinowm.history_size}'}
 frameskip: 5
@@ -47,8 +50,11 @@ dinowm:
   action_dim: 4
   action_embed_dim: 10
 
+num_masked_slots: 2
+
 predictor_lr: 5e-4
 action_encoder_lr: 5e-4
+proprio_head_lr: 5e-4
 
 videosaur:
   NUM_SLOTS: 7
@@ -67,6 +73,8 @@ agent_centric:
   mlp_dim: 256
   dropout: 0.1
   stop_gradient_agent_to_object: true
+  masked_history_loss_weight: 1.0
+  proprio_loss_weight: 1.0
   object_loss_weight: 1.0
   agent_loss_weight: 1.0
 

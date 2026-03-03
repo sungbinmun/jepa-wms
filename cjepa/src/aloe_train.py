@@ -86,7 +86,8 @@ def main(params):
             logger_name = exp_name
             logger_id = None
         wandb.init(
-            project=params.project,
+            project="ocjepa",
+            entity="brian0309",
             name=logger_name,
             id=logger_id,
             dir=ckp_path,
