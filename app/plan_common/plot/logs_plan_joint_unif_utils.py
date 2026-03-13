@@ -576,7 +576,8 @@ def plot_task_eval_data(
 def main():
     # ==============================================
     # Paths are constructed using environment variables from macros.py
-    jepa_dir = os.path.join(JEPAWM_HOME, "jepa-wms")
+    repo_candidate = os.path.join(JEPAWM_HOME, "jepa-wms")
+    jepa_dir = repo_candidate if os.path.isdir(repo_candidate) else JEPAWM_HOME
     local_plan_common_dir = os.path.join(jepa_dir, "app/plan_common/local")
 
     base_dir = os.path.join(local_plan_common_dir, "paper-app")

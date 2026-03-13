@@ -135,7 +135,8 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
     cfg = parse_cfg(cfg)
     set_seed(cfg.meta.seed)
     cfg.rank = rank
-    cfg.world_size = dist.get_world_size()
+    dist_ready = dist.is_available() and dist.is_initialized()
+    cfg.world_size = dist.get_world_size() if dist_ready else 1
     cfg.device = device
     cfg.num_active_gpus = cfg.world_size
     cfg.active_ranks = [i for i in range(cfg.world_size)]
@@ -245,7 +246,8 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
                 total_lpips,
                 total_emb_l2,
             ) = evaluator.eval(cfg, agent, env, task_idx=task_idx, ep=ep)
-            dist.barrier()  # should not provoke any error
+            if dist_ready and cfg.world_size > 1:
+                dist.barrier()  # synchronize ranks only when distributed is initialized
             episode_end_time = time()
             # Check for duplicate task and episode index
             if (task_idx, ep) in processed_episodes:
@@ -287,7 +289,7 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
             }
         )
 
-    if cfg.distributed.distribute_multitask_eval:
+    if cfg.distributed.distribute_multitask_eval and dist_ready and cfg.world_size > 1:
         all_results = [None] * cfg.world_size
         log.info(f"{rank=}: {results=}")
         if rank == 0:

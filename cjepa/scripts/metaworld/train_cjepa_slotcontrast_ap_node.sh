@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Can be run from anywhere:
-#   bash /home/sungbin/jepa-wms/cjepa/scripts/metaworld/train_cjepa_slotcontrast_agent_centric.sh
+#   bash /home/sungbin/jepa-wms/cjepa/scripts/metaworld/train_cjepa_slotcontrast_ap_node.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CJEPA_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -47,9 +47,9 @@ if [[ -n "${WANDB_NAME:-}" ]]; then
   WANDB_OVERRIDES+=(wandb.name="${WANDB_NAME}")
 fi
 
-python3 src/train/train_causalwm_agent_centric_from_pusht_slot.py \
-  --config-name config_train_causal_agent_centric_metaworld_slot \
-  output_model_name="metaworld_acjepa_v2" \
+python3 src/train/train_causalwm_AP_node_pusht_slot.py \
+  --config-name config_train_causal_metaworld_ap_node_slot \
+  output_model_name="metaworld_cjepa_apnode_v1" \
   embedding_dir="${SLOTPATH}" \
   action_dir="${ACTION_PATH}" \
   proprio_dir="${PROPRIO_PATH}" \

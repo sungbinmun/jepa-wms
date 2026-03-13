@@ -369,4 +369,164 @@ class MaskedSlot_AP_Predictor(MaskedSlotPredictor):
         is_slot_masked[masked_indices] = True
         
         return is_slot_masked, torch.from_numpy(masked_indices).to(device)
+
+
+class MaskedSlotAgentDeltaPredictor(MaskedSlotPredictor):
+    def __init__(
+        self,
+        num_slots: int,
+        slot_dim: int = 64,
+        history_frames: int = 3,
+        pred_frames: int = 2,
+        num_masked_slots: int = 2,
+        seed: int = 42,
+        depth: int = 6,
+        heads: int = 8,
+        dim_head: int = 64,
+        mlp_dim: int = 2048,
+        dropout: float = 0.1,
+        num_special_slots: int = 2,
+        future_conditioning_indices: tuple[int, ...] = (0,),
+    ):
+        super().__init__(
+            num_slots=num_slots,
+            slot_dim=slot_dim,
+            history_frames=history_frames,
+            pred_frames=pred_frames,
+            num_masked_slots=num_masked_slots,
+            seed=seed,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+        )
+        self.num_special_slots = int(num_special_slots)
+        if self.num_special_slots < 1:
+            raise ValueError("num_special_slots must be >= 1")
+        self.future_conditioning_indices = tuple(int(idx) for idx in future_conditioning_indices)
+        if any(idx < 0 or idx >= self.num_slots for idx in self.future_conditioning_indices):
+            raise ValueError("future_conditioning_indices must be valid slot indices")
+
+    def get_mask_indices(self, batch_size, device):
+        rng = np.random.RandomState(self.seed)
+        num_object_slots = self.num_slots - self.num_special_slots
+        masked_indices = rng.choice(num_object_slots, self.num_masked_slots, replace=False)
+        is_slot_masked = torch.zeros(self.num_slots, dtype=torch.bool, device=device)
+        is_slot_masked[masked_indices] = True
+        return is_slot_masked, torch.from_numpy(masked_indices).to(device)
+
+    def _build_query_grid(self, x_full):
+        B, T_total, S, D = x_full.shape
+        anchors = x_full[:, 0, :, :]
+        anchor_queries = self.id_projector(anchors)
+        tokens_grid = self.mask_token.expand(B, T_total, S, D)
+        pos_grid = self.time_pos_embed.expand(B, T_total, S, D)
+        anchor_grid = anchor_queries.unsqueeze(1).expand(B, T_total, S, D)
+        return tokens_grid + pos_grid + anchor_grid
+
+    def prepare_input(self, x_full):
+        """
+        Args:
+            x_full: (B, T_total, S, D)
+                Tokens for the complete history+future window. The last
+                `num_future_conditioning_slots` tokens are treated as visible
+                conditioning tokens in future frames.
+        """
+        B, T_total, S, D = x_full.shape
+        if T_total != self.total_frames:
+            raise ValueError(f"Expected T_total={self.total_frames}, got {T_total}")
+        device = x_full.device
+
+        if self.num_masked_slots > 0:
+            is_slot_masked, masked_indices = self.get_mask_indices(B, device)
+        else:
+            masked_indices = torch.tensor([], dtype=torch.long, device=device)
+            is_slot_masked = torch.zeros(self.num_slots, dtype=torch.bool, device=device)
+
+        final_input = self._build_query_grid(x_full).clone()
+        final_input[:, 0, :, :] = x_full[:, 0, :, :] + self.time_pos_embed[:, 0, :, :]
+
+        if self.num_masked_slots > 0:
+            unmasked_indices = torch.where(~is_slot_masked)[0]
+            unmasked_object_indices = unmasked_indices[unmasked_indices < (self.num_slots - self.num_special_slots)]
+        else:
+            unmasked_object_indices = torch.arange(0, self.num_slots - self.num_special_slots, device=device)
+
+        if len(unmasked_object_indices) > 0 and self.history_frames > 1:
+            real_history = x_full[:, 1 : self.history_frames, unmasked_object_indices, :]
+            history_pos = self.time_pos_embed[:, 1 : self.history_frames, :, :].expand(B, self.history_frames - 1, S, D)
+            final_input[:, 1 : self.history_frames, unmasked_object_indices, :] = (
+                real_history + history_pos[:, :, unmasked_object_indices, :]
+            )
+
+        # Agent slot and transition token remain visible throughout history.
+        special_indices = torch.arange(self.num_slots - self.num_special_slots, self.num_slots, device=device)
+        if len(special_indices) > 0 and self.history_frames > 1:
+            real_special_history = x_full[:, 1 : self.history_frames, special_indices, :]
+            history_pos = self.time_pos_embed[:, 1 : self.history_frames, :, :].expand(B, self.history_frames - 1, S, D)
+            final_input[:, 1 : self.history_frames, special_indices, :] = (
+                real_special_history + history_pos[:, :, special_indices, :]
+            )
+
+        # Future conditioning tokens stay visible. Future agent/object slots remain queries.
+        if len(self.future_conditioning_indices) > 0 and self.pred_frames > 0:
+            cond_indices = torch.tensor(self.future_conditioning_indices, device=device, dtype=torch.long)
+            real_future_cond = x_full[:, self.history_frames :, cond_indices, :]
+            future_pos = self.time_pos_embed[:, self.history_frames :, :, :].expand(B, self.pred_frames, S, D)
+            final_input[:, self.history_frames :, cond_indices, :] = (
+                real_future_cond + future_pos[:, :, cond_indices, :]
+            )
+
+        return final_input, masked_indices
+
+    def forward(self, x_full):
+        B, T_total, S, D = x_full.shape
+        if T_total != self.total_frames:
+            raise ValueError(f"Expected x_full to have {self.total_frames} frames, got {T_total}")
+        x_input, masked_indices = self.prepare_input(x_full)
+        x_flat = rearrange(x_input, 'b t s d -> b (t s) d')
+        out_flat = self.transformer(x_flat)
+        out = rearrange(out_flat, 'b (t s) d -> b t s d', t=self.total_frames, s=S)
+        out = self.to_out(out)
+        return out, masked_indices
+
+    @torch.no_grad()
+    def inference(self, history_x, future_conditioning):
+        """
+        Args:
+            history_x: (B, T_hist, S, D)
+            future_conditioning: (B, T_pred, C, D), where C == len(future_conditioning_indices)
+        """
+        B, T_hist, S, D = history_x.shape
+        T_pred = self.pred_frames
+        if T_hist != self.history_frames:
+            raise ValueError(f"Expected history_x to have {self.history_frames} frames, got {T_hist}")
+        num_future_conditioning_slots = len(self.future_conditioning_indices)
+        if future_conditioning.shape[:3] != (B, T_pred, num_future_conditioning_slots):
+            raise ValueError(
+                "future_conditioning must have shape "
+                f"(B, {T_pred}, {num_future_conditioning_slots}, D), got {tuple(future_conditioning.shape)}"
+            )
+
+        inf_time_pos = self.time_pos_embed[:, -self.total_frames :, :, :]
+        anchors = history_x[:, 0, :, :]
+        anchor_queries = self.id_projector(anchors)
+
+        input_history = history_x + inf_time_pos[:, :T_hist, :, :]
+        tokens_grid = self.mask_token.expand(B, T_pred, S, D)
+        pos_grid = inf_time_pos[:, T_hist:, :, :].expand(B, T_pred, S, D)
+        anchor_grid = anchor_queries.unsqueeze(1).expand(B, T_pred, S, D)
+        input_future = tokens_grid + pos_grid + anchor_grid
+
+        if num_future_conditioning_slots > 0:
+            cond_indices = torch.tensor(self.future_conditioning_indices, device=history_x.device, dtype=torch.long)
+            input_future[:, :, cond_indices, :] = future_conditioning + pos_grid[:, :, cond_indices, :]
+
+        full_input = torch.cat([input_history, input_future], dim=1)
+        x_flat = rearrange(full_input, 'b t s d -> b (t s) d')
+        out_flat = self.transformer(x_flat)
+        out = rearrange(out_flat, 'b (t s) d -> b t s d', t=self.total_frames, s=S)
+        out = self.to_out(out)
+        return out[:, T_hist:, :, :]
     

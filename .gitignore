@@ -33,3 +33,4 @@ CLAUDE.md
 /logs
 /saved_checkpoints
 /.hf_chache
+/_local/**

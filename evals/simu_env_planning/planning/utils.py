@@ -21,6 +21,13 @@ from src.utils.logging import get_logger
 log = get_logger(__name__)
 
 FIGSIZE_BASE = (4.0, 3.0)
+plt.rcParams["font.family"] = "DejaVu Sans"
+
+# Keep overlay text style plain and readable in plan_vis GIFs.
+CV2_OVERLAY_FONT = cv2.FONT_HERSHEY_PLAIN
+CV2_OVERLAY_FONT_SCALE_SMALL = 0.8
+CV2_OVERLAY_FONT_SCALE_LARGE = 1.2
+CV2_OVERLAY_FONT_THICKNESS = 1
 
 
 def set_seed(seed):
@@ -185,10 +192,10 @@ def save_decoded_frames(pred_frames_over_iterations, costs, plan_vis_path, overl
                             frame_with_overlay,
                             cost_text,
                             (10, int(y_positions[0])),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.4,
+                            CV2_OVERLAY_FONT,
+                            CV2_OVERLAY_FONT_SCALE_SMALL,
                             (200, 200, 200),
-                            1,
+                            CV2_OVERLAY_FONT_THICKNESS,
                         )
 
                         # Show final cost value
@@ -197,34 +204,40 @@ def save_decoded_frames(pred_frames_over_iterations, costs, plan_vis_path, overl
                             frame_with_overlay,
                             cost_text,
                             (int(x1) - 50, int(y_positions[-1])),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.4,
+                            CV2_OVERLAY_FONT,
+                            CV2_OVERLAY_FONT_SCALE_SMALL,
                             (200, 200, 200),
-                            1,
+                            CV2_OVERLAY_FONT_THICKNESS,
                         )
                         # Add min/max values
                         cv2.putText(
                             frame_with_overlay,
                             f"Min: {global_min_cost:.2f}",
                             (w - 120, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.4,
+                            CV2_OVERLAY_FONT,
+                            CV2_OVERLAY_FONT_SCALE_SMALL,
                             (200, 200, 200),
-                            1,
+                            CV2_OVERLAY_FONT_THICKNESS,
                         )
                         cv2.putText(
                             frame_with_overlay,
                             f"Max: {global_max_cost:.2f}",
                             (w - 120, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.4,
+                            CV2_OVERLAY_FONT,
+                            CV2_OVERLAY_FONT_SCALE_SMALL,
                             (200, 200, 200),
-                            1,
+                            CV2_OVERLAY_FONT_THICKNESS,
                         )
 
                     # Add text showing the iteration number
                     cv2.putText(
-                        frame_with_overlay, f"Iter {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2
+                        frame_with_overlay,
+                        f"Iter {i+1}",
+                        (10, 30),
+                        CV2_OVERLAY_FONT,
+                        CV2_OVERLAY_FONT_SCALE_LARGE,
+                        (200, 200, 200),
+                        CV2_OVERLAY_FONT_THICKNESS,
                     )
 
                     overlay_frames.append(frame_with_overlay)

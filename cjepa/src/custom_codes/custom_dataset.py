@@ -1,10 +1,20 @@
 import numpy as np
-from stable_worldmodel.data.dataset import VideoDataset, Dataset
 import torch
 import stable_pretraining as spt
 import stable_worldmodel as swm
 from torch.utils.data import Dataset, DataLoader
 from loguru import logger as logging
+
+try:
+    from stable_worldmodel.data.dataset import VideoDataset
+except Exception:
+    class VideoDataset:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "stable_worldmodel.data.dataset.VideoDataset is unavailable in the installed "
+                "stable_worldmodel version. This fallback keeps slot-based MetaWorld training "
+                "working, but ClevrerVideoDataset requires the older dataset API."
+            )
 
 import pickle as pkl
 

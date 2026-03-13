@@ -28,7 +28,15 @@ def _default_parquet_dir() -> Path:
     root = os.environ.get("JEPAWM_DSET")
     if not root:
         raise ValueError("JEPAWM_DSET is not set. Pass --parquet-dir explicitly.")
-    return Path(root) / "Metaworld_multiview_full_merged" / "data"
+    root = Path(root)
+    candidates = [
+        root / "Metaworld_multiview_full_merged" / "data",
+        root / "Metaworld" / "data",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _decode_video_bytes(video_bytes: bytes) -> np.ndarray:
@@ -127,9 +135,15 @@ def main():
         default=None,
         help="Metaworld parquet directory. Default: $JEPAWM_DSET/Metaworld_multiview_full_merged/data",
     )
-    parser.add_argument("--video-key", type=str, default="video_gripper", choices=["video", "video_third", "video_gripper"])
-    parser.add_argument("--train-fraction", type=float, default=0.99)
-    parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument(
+        "--video-key",
+        type=str,
+        default="video",
+        choices=["video", "video_third", "video_gripper"],
+        help="Metaworld video column to extract. Default `video` matches the exterior planning camera.",
+    )
+    parser.add_argument("--train-fraction", type=float, default=0.9)
+    parser.add_argument("--split-seed", type=int, default=234)
     parser.add_argument("--proprio-indices", type=str, default="0,1,2,3")
     parser.add_argument("--max-rows", type=int, default=None, help="Optional cap for debugging.")
     parser.add_argument("--output-prefix", type=Path, required=True, help="Output prefix path without extension.")

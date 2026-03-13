@@ -16,6 +16,7 @@ import torch
 from tensordict import TensorDict
 
 matplotlib.use("Agg")
+matplotlib.rcParams["font.family"] = "DejaVu Sans"
 
 from evals.utils import prepare_obs
 

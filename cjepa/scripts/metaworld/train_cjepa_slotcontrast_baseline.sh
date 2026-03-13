@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run from cjepa root:
-#   cd /home/sungbinmun/jepa-wms/cjepa
-#   bash scripts/metaworld/train_cjepa_slotcontrast_baseline.sh
+# Can be run from anywhere:
+#   bash /home/sungbin/jepa-wms/cjepa/scripts/metaworld/train_cjepa_slotcontrast_baseline.sh
 
-export PYTHONPATH="$(pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CJEPA_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="$(cd "${CJEPA_ROOT}/.." && pwd)"
 
-SLOTCONTRAST_CKPT="${SLOTCONTRAST_CKPT:-/home/sungbinmun/jepa-wms/slotcontrast/logs/metaworld_mv_agseg/slotcontrast/metaworld_dinov3_512_mv_1/checkpoints/step=10000.ckpt}"
-SLOTCONTRAST_CFG="${SLOTCONTRAST_CFG:-/home/sungbinmun/jepa-wms/slotcontrast/logs/metaworld_mv_agseg/slotcontrast/metaworld_dinov3_512_mv_1/settings.yaml}"
-VIDEO_KEY="${VIDEO_KEY:-video_gripper}"
+cd "${CJEPA_ROOT}"
+export PYTHONPATH="${CJEPA_ROOT}"
 
-OUT_PREFIX="${OUT_PREFIX:-./outputs/metaworld_slotcontrast_mv_step10000}"
+SLOTCONTRAST_CKPT="${SLOTCONTRAST_CKPT:-${REPO_ROOT}/_local/checkpoints/slotcontrast/metaworld_dinov3_512_mv/checkpoints/step=93000.ckpt}"
+SLOTCONTRAST_CFG="${SLOTCONTRAST_CFG:-${REPO_ROOT}/_local/checkpoints/slotcontrast/metaworld_dinov3_512_mv/settings.yaml}"
+VIDEO_KEY="${VIDEO_KEY:-video}"
+
+OUT_PREFIX="${OUT_PREFIX:-./outputs/metaworld_slotcontrast_exterior_step10000}"
 SLOTPATH="${SLOTPATH:-${OUT_PREFIX}_slots.pkl}"
 ACTION_PATH="${ACTION_PATH:-${OUT_PREFIX}_actions.pkl}"
 PROPRIO_PATH="${PROPRIO_PATH:-${OUT_PREFIX}_proprio.pkl}"
@@ -19,6 +23,11 @@ STATE_PATH="${STATE_PATH:-${OUT_PREFIX}_states.pkl}"
 
 if [[ ! -f "${SLOTPATH}" || ! -f "${ACTION_PATH}" || ! -f "${PROPRIO_PATH}" || ! -f "${STATE_PATH}" ]]; then
   echo "[INFO] Missing slot/action/proprio/state pkl. Extracting from SlotContrast checkpoint..."
+  if ! python3 -c "import pyarrow.parquet" >/dev/null 2>&1; then
+    echo "[ERROR] Missing Python dependency: pyarrow"
+    echo "[ERROR] Install it in the active environment, then rerun."
+    exit 1
+  fi
   python3 src/custom_codes/extract_metaworld_slotcontrast_slots.py \
     --checkpoint "${SLOTCONTRAST_CKPT}" \
     --slotcontrast-config "${SLOTCONTRAST_CFG}" \
